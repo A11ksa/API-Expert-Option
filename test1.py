@@ -1,58 +1,65 @@
 #################################################################
+# ExpertOption runner (Demo/Real) with a single, clean auth flow
 # Example TEST CMD (TOKEN-only, Expert Option)
 #################################################################
 # ======================
 # python test1.py
 # ======================
-import time
-import logging
 import asyncio
-from typing import Dict, List, Any, Optional, Tuple
-
-from loguru import logger as loguru_logger
-from rich.table import Table
-from rich.console import Console
-from rich.panel import Panel
-from rich import print as rprint
+import time
+import threading
+from typing import Optional, Dict, Any, Tuple, List
 import pandas as pd
+from loguru import logger
+from rich import print as rprint
+from rich.console import Console
+from rich.prompt import Prompt
+from rich.panel import Panel
+from rich.table import Table
 
-from api_expert import AsyncExpertOptionClient, OrderDirection, load_config, get_token
-from api_expert.constants import TIMEFRAMES, get_asset_symbol, format_timeframe
-
-# ========================
+# ======================
 # Color tokens for console
-# ========================
+# ======================
 ENDC = "[white]"
 PURPLE = "[purple]"
 DARK_GRAY = "[bright_black]"
 OKCYAN = "[steel_blue1]"
 lg = "[green3]"
 r = "[red]"
+dr = "[dark_red]"
+dg = "[spring_green4]"
+dg2 = "[dark_green]"
 bl = "[blue]"
 g = "[green]"
 w = "[white]"
 cy = "[cyan]"
 ye = "[yellow]"
 yl = "[#FFD700]"
-warning = yl + "(" + w + "!" + yl + ")"
-wait = yl + "(" + w + "●" + yl + ")"
+orange = "[dark_orange3]"
+Bold_orange = "[bold orange1]"
+Bold_green = "[bold green]"
+info = g + "[" + w + "i" + g + "]" + ENDC
+attempt = g + "[" + w + "+" + g + "]" + ENDC
+sleep = bl + "[" + w + "*" + bl + "]" + ENDC
+error = g + "[" + r + "!" + g + "]" + ENDC
+success = w + "(" + lg + "*" + w + ")" + ENDC
+INPUT = lg + "(" + cy + "~" + lg + ")" + ENDC
+warning = yl + "(" + w + "!" + yl + ")" + ENDC
+wait = yl + "(" + w + "●" + yl + ")" + ENDC
 win = w + "[" + lg + "✓" + w + "]" + ENDC
 loss = w + "[" + r + "x" + w + "]" + ENDC
 draw = w + "[" + OKCYAN + "≈" + w + "]" + ENDC
-info = g + "[" + w + "i" + g + "]" + ENDC
 
-# ========================
-# Logging config
-# ========================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler(f"log-{time.strftime('%Y-%m-%d')}.txt", encoding="utf-8")]
+# API imports
+from api_expert import (
+    AsyncExpertOptionClient,
+    load_config, save_config, save_session, get_token,
 )
-logger = logging.getLogger(__name__)
-loguru_logger.remove()
-loguru_logger.add(f"log-{time.strftime('%Y-%m-%d')}.txt", level="INFO", encoding="utf-8", backtrace=True, diagnose=True)
+from api_expert.constants import TIMEFRAMES, get_asset_symbol
+from api_expert.models import OrderDirection
+from api_expert.utils import format_timeframe
 
+# Helpers
 # ========================
 # Assets Table
 # ========================
@@ -237,46 +244,60 @@ def choose_best_asset(assets: Dict[str, Dict[str, Any]], timeframe: str) -> Opti
     payout, aid = best
     return aid, timeframe, payout
 
-# ========================
-# Main
-# ========================
+# ======================
+# Main 
+# ======================
 async def main():
+    console = Console()
     client: Optional[AsyncExpertOptionClient] = None
     try:
-        # Obtain token
-        try:
-            success, session = await get_token(is_demo=True)
-        except RuntimeError:
-            creds = load_config()
-            email = creds.get("email") or input("Enter your email: ")
-            password = creds.get("password") or input("Enter your password: ")
-            success, session = await get_token(email=email, password=password, is_demo=True)
+        # Step 1: Load or ask for credentials
+        cfg = load_config()
+        email = cfg.get("email", "") or Prompt.ask(f"{INPUT} {DARK_GRAY}Enter {cy}ExpertOption{DARK_GRAY} Email{ENDC}{yl}")
+        password = cfg.get("password", "") or Prompt.ask(f"{INPUT} {DARK_GRAY}Enter {cy}ExpertOption{DARK_GRAY} Password{ENDC}{yl}", password=True)
+        if cfg.get("email") and cfg.get("password"):
+            change = Prompt.ask(f'{INPUT} {DARK_GRAY}Change saved credentials for {cy}{cfg["email"]}{DARK_GRAY}[{g}y{DARK_GRAY}]?{ENDC}').strip().lower()
+            if change == "y":
+                email = Prompt.ask(f"{INPUT} {DARK_GRAY}Enter {cy}ExpertOption{DARK_GRAY} Email{ENDC}{yl}")
+                password = Prompt.ask(f"{INPUT} {DARK_GRAY}Enter {cy}ExpertOption{DARK_GRAY} Password{ENDC}{yl}", password=True)
+        cfg["email"] = email
+        cfg["password"] = password
+        save_config(cfg)
 
-        if not success or not session.get("token"):
-            rprint(Panel(f"[red]Failed to obtain TOKEN.[/red]", title=f"{info} Auth", border_style="red"))
+        # Step 2: Choose account type
+        choice = Prompt.ask(f"{INPUT} {DARK_GRAY}Choose account type {w}({Bold_green}1{w} = REAL, {Bold_green}2{w} = DEMO){ENDC}")
+        is_demo = (choice != "1")
+
+        ok, session = await get_token(is_demo=is_demo, email=email, password=password)
+        if not ok or not isinstance(session, dict) or not session.get("token"):
+            console.print(f"{error} {DARK_GRAY}Failed to obtain token.{ENDC}")
             return
-
         token = session["token"]
-        is_demo = bool(session.get("is_demo", 1))
+        console.print(f"{info} {DARK_GRAY}Using token: {token[:12]}... (demo={is_demo}){ENDC}")
+        logger.info(f"Token acquired for {'Demo' if is_demo else 'Real'} account")
+        save_session({
+            "token": token,
+            "is_demo": 1 if is_demo else 0,
+            "ts": int(time.time()),
+        })
 
+        # Step 3: Connect once
         client = AsyncExpertOptionClient(
             token=token,
             is_demo=is_demo,
             persistent_connection=False,
+            enable_logging=True,
         )
-
-        # Connect
-        connected = await client.connect()
-        if not connected:
-            rprint(Panel(f"[red]Failed to connect to server.[/red]", title=f"{info} Connection", border_style="red"))
+        if not await client.connect():
+            console.print(f"{error} {DARK_GRAY}Failed to connect to ExpertOption server.{ENDC}")
             return
+        rprint(Panel(f"{OKCYAN}Connected to {'Demo' if is_demo else 'Real'} account!{ENDC}", title=f"{g}Status{ENDC}"))
+        logger.info("Connected successfully")
 
-        rprint(Panel(f"{OKCYAN}Connected!{ENDC}", title=f"{g}Status{ENDC}"))
-
-        last_fetch = 0.0
-        interval = 60.0  # refresh assets every minute
+        # Step 4: Main loop (balance → assets → candles → live → test orders)
+        last_assets_refresh = 0.0
+        refresh_interval = 60.0
         assets_cache: Dict[str, Dict[str, Any]] = {}
-
         while True:
             try:
                 if not getattr(client, "is_connected", False):
@@ -300,10 +321,10 @@ async def main():
                 )
 
                 now = time.time()
-                if now - last_fetch >= interval or not assets_cache:
+                if now - last_assets_refresh >= refresh_interval or not assets_cache:  # تصحيح المتغيرات
                     assets_cache = await client.get_available_assets()
                     print_assets_table(assets_cache, only_open=True, top=20)
-                    last_fetch = now
+                    last_assets_refresh = now  # تصحيح التحديث
 
                 # Choose best 1m asset
                 choice = choose_best_asset(assets_cache, "1m")
@@ -369,19 +390,12 @@ async def main():
                 rprint(f"{info} {DARK_GRAY}Order placed with ID: {ye}{order.order_id}{ENDC}")
                 await check_win_task(client, order.order_id)
 
-                await asyncio.sleep(60)
+                await asyncio.sleep(10)
 
             except Exception as e:
-                logger.error(f"Error in main loop: {e}", exc_info=True)
-                rprint(
-                    Panel(
-                        f"[red]Main loop error:[/red] {str(e)}",
-                        title=f"{info} Main Loop Error",
-                        border_style="red",
-                    )
-                )
-                await asyncio.sleep(10)
-                continue
+                logger.error(f"{error} Exception in main loop: {e}")
+                await asyncio.sleep(5)
+
     except KeyboardInterrupt:
         logger.info("Stopping due to user interrupt.")
     finally:
