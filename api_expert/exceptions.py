@@ -3,7 +3,7 @@ import time
 from typing import Optional
 from loguru import logger
 
-# Logging (keep your existing style)
+# Logging
 logger.remove()
 log_filename = f"log-{time.strftime('%Y-%m-%d')}.txt"
 logger.add(log_filename, level="INFO", encoding="utf-8", backtrace=True, diagnose=True)
