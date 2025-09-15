@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 import uuid
-from typing import Dict, List, Any, Callable, Optional, Union
+from typing import Dict, List, Any, Callable, Optional, Union, Set, Tuple
 from datetime import datetime, timedelta
 from collections import defaultdict
 import pandas as pd
@@ -25,6 +25,13 @@ from .models import (
     UserFeedInfo,
     MultipleActionResponse,
     EnvironmentInfo,
+    Achievement,
+    Badge,
+    ActivatedBonus,
+    ReferralOfferInfo,
+    DepositSum,
+    TradeHistoryEntry,
+    PushNotification,
 )
 from .constants import (
     ASSETS,
@@ -41,9 +48,9 @@ from .exceptions import ConnectionError, AuthenticationError, OrderError, Invali
 from .utils import (
     sanitize_symbol,
     format_session_id,
-    retry_async,
     format_initial_message,
     resolve_currency,
+    format_timeframe,  # Add this line
 )
 
 # Logging setup
@@ -51,6 +58,32 @@ logger.remove()
 log_filename = f"log-{time.strftime('%Y-%m-%d')}.txt"
 logger.add(log_filename, level="INFO", encoding="utf-8", backtrace=True, diagnose=True)
 
+def candles_to_dataframe(candles: List[Candle]) -> pd.DataFrame:
+    data = [
+        {
+            "timestamp": c.timestamp,
+            "open": c.open,
+            "high": c.high,
+            "low": c.low,
+            "close": c.close,
+            "volume": c.volume,
+            "asset": c.asset,
+        }
+        for c in candles
+    ]
+    df = pd.DataFrame(data)
+    if not df.empty:
+        df.set_index("timestamp", inplace=True)
+        df.sort_index(inplace=True)
+    return df
+
+class _ConnectionState:
+    def __init__(self, getter: Callable[[], bool]):
+        self._getter = getter
+    def __bool__(self) -> bool:
+        return self._getter()
+    def __call__(self) -> bool:
+        return self._getter()
 
 class AsyncExpertOptionClient:
     """Professional async ExpertOption API client with modern Python practices"""
@@ -107,12 +140,26 @@ class AsyncExpertOptionClient:
         self._event_callbacks: Dict[str, List[Callable]] = defaultdict(list)
         self._request_id_to_server_id: Dict[str, str] = {}
 
+        # New stores for new actions
+        self._achievements: List[Achievement] = []
+        self._badges: List[Badge] = []
+        self._bonuses: List[ActivatedBonus] = []
+        self._deposit_sum: Optional[DepositSum] = None
+        self._referral_info: Optional[ReferralOfferInfo] = None
+        self._trade_history: List[TradeHistoryEntry] = []
+        self._push_notifications: List[PushNotification] = []
+        self._promo_open_payload: Optional[Dict[str, Any]] = None
+
         # Fast candle pipeline
-        # last open candle per key: f"{asset}_{tf}" -> {"t": ts, "o":..,"h":..,"l":..,"c":..}
         self._live_last: Dict[str, Dict[str, float]] = {}
         self._ring_limit: int = 600
         self._candle_stream_subs: Dict[str, asyncio.Queue] = {}
         self._tick_counts: Dict[str, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
+        self._active_subscriptions: Set[Tuple[int, int]] = set()
+
+        # Asset readiness synchronization (to prevent race conditions)
+        self._asset_ready: defaultdict[int, asyncio.Event] = defaultdict(asyncio.Event)
+        self._assets_index_ready: asyncio.Event = asyncio.Event()
 
         self._setup_event_handlers()
 
@@ -126,7 +173,9 @@ class AsyncExpertOptionClient:
         self._reconnect_task: Optional[asyncio.Task] = None
         self._assets_update_task: Optional[asyncio.Task] = None
         self._is_persistent = False
+        self.websocket_is_connected = False
 
+        self.is_connected = _ConnectionState(self._check_connected)
         self._connection_stats = {
             "total_connections": 0,
             "successful_connections": 0,
@@ -137,13 +186,11 @@ class AsyncExpertOptionClient:
             "connection_start_time": None,
         }
 
-        # Internal auth gate (emit "authenticated" once when profile arrives)
         self._auth_emitted: bool = False
 
         logger.info(
             f"Initialized ExpertOption client (demo={is_demo}, persistent={persistent_connection}) with enhanced monitoring"
-            if enable_logging
-            else ""
+            if enable_logging else ""
         )
 
     def _setup_event_handlers(self):
@@ -204,21 +251,11 @@ class AsyncExpertOptionClient:
                     logger.warning(f"WebSocket connect failed for region '{region}', trying next.")
                     continue
 
-                # 1) Context
                 await self._send_set_context()
-
-                # 2) Bootstrap (multipleAction) includes defaultSubscribeCandles/etc.
-                initial_message = format_initial_message(
-                    token=self.token,
-                    is_demo=self.is_demo,
-                )
+                initial_message = format_initial_message(self.token, self.is_demo)
                 await self._websocket.send_message(initial_message)
-
-                # 3) Profile (balance)
                 await self._request_balance_update()
                 await asyncio.sleep(0.2)
-
-                # 4) Keep-alive
                 await self._start_keep_alive_tasks()
                 self._connection_stats["successful_connections"] += 1
                 self.websocket_is_connected = True
@@ -233,6 +270,7 @@ class AsyncExpertOptionClient:
         logger.info("Starting persistent connection with automatic keep-alive...")
         from .connection_keep_alive import ConnectionKeepAlive
         self._keep_alive_manager = ConnectionKeepAlive(self.token, self.is_demo)
+        # wire all known events
         self._keep_alive_manager.add_event_handler('connected', self._on_keep_alive_connected)
         self._keep_alive_manager.add_event_handler('reconnected', self._on_keep_alive_reconnected)
         self._keep_alive_manager.add_event_handler('message_received', self._on_keep_alive_message)
@@ -245,9 +283,11 @@ class AsyncExpertOptionClient:
         self._keep_alive_manager.add_event_handler('candles_received', self._on_candles_received)
         self._keep_alive_manager.add_event_handler('assets_updated', self._on_assets_updated)
         self._keep_alive_manager.add_event_handler('stream_update', self._on_stream_update)
+        # forward everything else
+        self._keep_alive_manager.add_event_handler('json_data', self._on_json_data)
         self._keep_alive_manager.add_event_handler('tradersChoice', self._on_traders_choice)
         self._keep_alive_manager.add_event_handler('userFeedInfo', self._on_user_feed_info)
-        self._keep_alive_manager.add_event_handler('json_data', self._on_json_data)
+
         success = await self._keep_alive_manager.connect_with_keep_alive(urls)
         if success:
             try:
@@ -309,6 +349,20 @@ class AsyncExpertOptionClient:
                 logger.warning(f"Ping failed: {e}")
                 break
 
+    async def _reply_pong(self, data: Dict[str, Any]) -> None:
+        try:
+            msg = data.get("message") or {}
+            stamp = msg.get("data")
+            payload = {
+                "action": "pong",
+                "message": {"data": stamp},
+                "token": self.token,
+                "ns": data.get("ns") or self._next_ns(),
+            }
+            await self.send_message(json.dumps(payload))
+        except Exception as e:
+            logger.warning(f"Failed to reply pong: {e}")
+
     async def _reconnection_monitor(self):
         while not self._is_persistent:
             await asyncio.sleep(1)
@@ -323,8 +377,7 @@ class AsyncExpertOptionClient:
                     logger.error(f"Reconnection error: {e}")
                 await asyncio.sleep(1)
 
-    @property
-    def is_connected(self) -> bool:
+    def _check_connected(self) -> bool:
         if self._is_persistent and self._keep_alive_manager:
             return self._keep_alive_manager.is_connected
         else:
@@ -337,9 +390,24 @@ class AsyncExpertOptionClient:
         else:
             return self._websocket.connection_info
 
+    async def _ensure_connection(self, timeout: float = 5.0) -> bool:
+        start = time.time()
+        while time.time() - start < timeout:
+            if self._keep_alive_manager and self._keep_alive_manager.is_connected:
+                return True
+            if self._websocket.is_connected:
+                return True
+            await asyncio.sleep(0.05)
+        return (self._keep_alive_manager.is_connected if self._keep_alive_manager else self._websocket.is_connected)
+
     async def send_message(self, message: str) -> bool:
         try:
-            await self._websocket.send_message(message)
+            if not await self._ensure_connection():
+                raise ConnectionError("WebSocket is not connected")
+            if self._keep_alive_manager and self._keep_alive_manager.is_connected:
+                await self._keep_alive_manager.send_message(message)
+            else:
+                await self._websocket.send_message(message)
             self._connection_stats["messages_sent"] += 1
             logger.info(f"SENT: {message}")
             return True
@@ -368,7 +436,7 @@ class AsyncExpertOptionClient:
             "ns": self._next_ns(),
             "token": self.token,
         }
-        await self._websocket.send_message(json.dumps(payload))
+        await self.send_message(json.dumps(payload))
         logger.debug(f"setContext sent (is_demo={mode}).")
 
     async def _on_error(self, data: Dict[str, Any]) -> None:
@@ -377,7 +445,6 @@ class AsyncExpertOptionClient:
         ns = data.get("ns") or (msg.get("ns") if isinstance(msg, dict) else None)
         if ns and ns in self._pending_order_requests:
             order = self._pending_order_requests.pop(ns, None)
-            # Build a minimal OrderResult reflecting the rejection
             try:
                 result = OrderResult(
                     order_id=ns,
@@ -398,7 +465,6 @@ class AsyncExpertOptionClient:
                 )
                 self._order_results[ns] = result
             except Exception:
-                # Fallback if anything goes wrong in building the model
                 self._order_results[ns] = OrderResult(
                     order_id=ns,
                     server_id=None,
@@ -431,41 +497,30 @@ class AsyncExpertOptionClient:
             await self._emit_event("token", data)
 
     async def _on_profile(self, data: Dict[str, Any]) -> None:
-        """
-        Handle 'profile' messages from server and update balances.
-        Supports multiple server payload shapes (demo/real, single balance with is_demo, balances array).
-        """
         try:
             msg = data.get("message", {}) if isinstance(data, dict) else {}
             profile = msg.get("profile", msg) if isinstance(msg, dict) else {}
             if not isinstance(profile, dict):
                 return
-
-            # UID
             uid = profile.get("id") or profile.get("uid")
             if uid:
                 self.uid = uid
                 logger.info(f"Profile UID updated: {self.uid}")
-
-            # currency via utils (accepts mapping)
             try:
                 from .constants import CURRENCIES
             except Exception:
                 CURRENCIES = None
             currency = resolve_currency(profile, CURRENCIES)
 
-            # --- Collect balances from any shape ---
             demo_amount: Optional[float] = None
             real_amount: Optional[float] = None
 
-            # Shape A: demo_balance / real_balance fields
             if "demo_balance" in profile or "real_balance" in profile:
                 if profile.get("demo_balance") is not None:
                     demo_amount = float(profile["demo_balance"])
                 if profile.get("real_balance") is not None:
                     real_amount = float(profile["real_balance"])
 
-            # Shape B: single 'balance' + 'is_demo'
             if demo_amount is None and real_amount is None and "balance" in profile:
                 bal = profile.get("balance")
                 is_demo_flag = str(profile.get("is_demo")).lower() in ("1", "true")
@@ -474,12 +529,9 @@ class AsyncExpertOptionClient:
                 except Exception:
                     bal = None
                 if bal is not None:
-                    if is_demo_flag:
-                        demo_amount = bal
-                    else:
-                        real_amount = bal
+                    if is_demo_flag: demo_amount = bal
+                    else: real_amount = bal
 
-            # Shape C: "balances" array
             balances = msg.get("balances") or profile.get("balances")
             if isinstance(balances, list):
                 for b in balances:
@@ -498,7 +550,6 @@ class AsyncExpertOptionClient:
                     except Exception:
                         continue
 
-            # Build Balance objects if available
             if demo_amount is not None:
                 self._balance_demo = Balance(balance=float(demo_amount), currency=str(currency), is_demo=True)
                 logger.info(f"Demo balance: {self._balance_demo.balance} {self._balance_demo.currency}")
@@ -506,9 +557,7 @@ class AsyncExpertOptionClient:
                 self._balance_real = Balance(balance=float(real_amount), currency=str(currency), is_demo=False)
                 logger.info(f"Real balance: {self._balance_real.balance} {self._balance_real.currency}")
 
-            # Select active balance based on client is_demo
             self._balance = self._balance_demo if self.is_demo else (self._balance_real or self._balance_demo)
-
         except Exception as e:
             logger.error(f"Failed to process profile (non-fatal): {e}")
         finally:
@@ -551,7 +600,35 @@ class AsyncExpertOptionClient:
                 await self._on_feed_or_stats(data)
             if action in ("environment", "getCandlesTimeframes", "setTimeZone", "getCurrency", "getCountries"):
                 await self._on_environment(data)
-            if action in ("pong", "ping"):
+            # NEW actions:
+            if action == "checkPushNotifications": 
+                await self._on_check_push_notifications(data)
+            if action == "userAchievements":       
+                await self._on_user_achievements(data)
+            if action == "userBadges":             
+                await self._on_user_badges(data)
+            if action == "activatedBonuses":       
+                await self._on_activated_bonuses(data)
+            if action == "userDepositSum":         
+                await self._on_user_deposit_sum(data)
+            if action == "referralOfferInfo":      
+                await self._on_referral_offer_info(data)
+            if action == "tradeHistory":           
+                await self._on_trade_history(data)
+            if action == "promoOpen":              
+                await self._on_promo_open(data)
+            if action == "expertSubscribe":        
+                await self._on_expert_subscribe(data)
+            if action == "cancelOption":           
+                await self._on_cancel_option(data)
+            if action == "setConversionData":      
+                await self._on_set_conversion_data(data)
+            if action == "getOneTimeToken":        
+                await self._on_token(data)
+            if action == "ping":
+                await self._reply_pong(data)
+                return
+            if action == "pong":
                 return
             if action == "error":
                 await self._on_error(data)
@@ -577,6 +654,27 @@ class AsyncExpertOptionClient:
                     await self._on_candles_received(a)
                 elif act == "assets":
                     await self._on_assets(a)
+                # NEW in multipleAction as well
+                elif act == "userAchievements":
+                    await self._on_user_achievements(a)
+                elif act == "userBadges":
+                    await self._on_user_badges(a)
+                elif act == "activatedBonuses":
+                    await self._on_activated_bonuses(a)
+                elif act == "userDepositSum":
+                    await self._on_user_deposit_sum(a)
+                elif act == "referralOfferInfo":
+                    await self._on_referral_offer_info(a)
+                elif act == "tradeHistory":
+                    await self._on_trade_history(a)
+                elif act == "checkPushNotifications":
+                    await self._on_check_push_notifications(a)
+                elif act == "promoOpen":
+                    await self._on_promo_open(a)
+                elif act == "expertSubscribe":
+                    await self._on_expert_subscribe(a)
+                elif act == "setConversionData":
+                    await self._on_set_conversion_data(a)
         except Exception as e:
             logger.error(f"Error processing multipleAction: {e}")
 
@@ -595,9 +693,157 @@ class AsyncExpertOptionClient:
             except Exception:
                 continue
         return f"ASSET_{aid_int}"
+
+    # Helper: known asset ids & waiting
+    def _known_asset_ids(self) -> Set[int]:
+        try:
+            from .constants import ASSETS_ID_SYMBOL
+            static_ids = set(int(k) for k in ASSETS_ID_SYMBOL.keys())
+        except Exception:
+            static_ids = set()
+        try:
+            dynamic_ids = {int(v.get("id")) for v in self._assets_data.values() if v.get("id") is not None}
+        except Exception:
+            dynamic_ids = set()
+        return static_ids | dynamic_ids
+
+    async def wait_asset(self, asset_id: int, timeout: float = 2.0) -> bool:
+        """Wait until asset_id is known (indexed) or timeout."""
+        aid = int(asset_id)
+        if aid in self._known_asset_ids():
+            # mark as ready for any concurrent waiters
+            try: self._asset_ready[aid].set()
+            except Exception: pass
+            return True
+        # trigger a fresh assets request (non-blocking) to speed up indexing
+        try:
+            asyncio.create_task(self._get_raw_asset())
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(self._asset_ready[aid].wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return aid in self._known_asset_ids()
     # endregion
 
     # region New Message Handlers
+    async def _on_check_push_notifications(self, data: Dict[str, Any]) -> None:
+        try:
+            msg = data.get("message", {}) or {}
+            items = msg.get("notifications") or msg.get("items") or []
+            parsed = []
+            for it in items or []:
+                parsed.append(PushNotification(
+                    id=str(it.get("id")) if it.get("id") is not None else None,
+                    title=it.get("title"),
+                    body=it.get("body"),
+                    created_at=it.get("created_at") or it.get("ts"),
+                    read=it.get("read"),
+                ))
+            self._push_notifications = parsed
+            logger.info(f"Push notifications: {len(parsed)}")
+            await self._emit_event("checkPushNotifications", {"notifications": [n.dict() for n in parsed]})
+        except Exception as e:
+            logger.error(f"Error processing push notifications: {e}")
+
+    async def _on_user_achievements(self, data: Dict[str, Any]) -> None:
+        try:
+            arr = (data.get("message") or {}).get("achievements") or (data.get("message") or {}).get("items") or []
+            self._achievements = [Achievement(**a) if isinstance(a, dict) else Achievement() for a in arr]
+            logger.info(f"Achievements received: {len(self._achievements)}")
+            await self._emit_event("userAchievements", {"achievements": [a.dict() for a in self._achievements]})
+        except Exception as e:
+            logger.error(f"userAchievements error: {e}")
+
+    async def _on_user_badges(self, data: Dict[str, Any]) -> None:
+        try:
+            arr = (data.get("message") or {}).get("badges") or (data.get("message") or {}).get("items") or []
+            self._badges = [Badge(**b) if isinstance(b, dict) else Badge() for b in arr]
+            logger.info(f"Badges received: {len(self._badges)}")
+            await self._emit_event("userBadges", {"badges": [b.dict() for b in self._badges]})
+        except Exception as e:
+            logger.error(f"userBadges error: {e}")
+
+    async def _on_activated_bonuses(self, data: Dict[str, Any]) -> None:
+        try:
+            arr = (data.get("message") or {}).get("bonuses") or (data.get("message") or {}).get("items") or []
+            self._bonuses = [ActivatedBonus(**b) if isinstance(b, dict) else ActivatedBonus() for b in arr]
+            logger.info(f"Activated bonuses: {len(self._bonuses)}")
+            await self._emit_event("activatedBonuses", {"bonuses": [b.dict() for b in self._bonuses]})
+        except Exception as e:
+            logger.error(f"activatedBonuses error: {e}")
+
+    async def _on_user_deposit_sum(self, data: Dict[str, Any]) -> None:
+        try:
+            msg = data.get("message") or {}
+            payload = {"total_usd": msg.get("total") or msg.get("sum"), "currency": msg.get("currency")}
+            self._deposit_sum = DepositSum(**payload)
+            await self._emit_event("userDepositSum", {"sum": self._deposit_sum.dict()})
+        except Exception as e:
+            logger.error(f"userDepositSum error: {e}")
+
+    async def _on_referral_offer_info(self, data: Dict[str, Any]) -> None:
+        try:
+            msg = data.get("message") or {}
+            info = msg.get("referralOfferInfo") or msg
+            if isinstance(info, dict):
+                self._referral_info = ReferralOfferInfo(
+                    active=info.get("active", info.get("isActive")),
+                    reward_percent=info.get("reward_percent", info.get("percent")),
+                    code=info.get("code"),
+                )
+                await self._emit_event("referralOfferInfo", {"info": self._referral_info.dict()})
+        except Exception as e:
+            logger.error(f"referralOfferInfo error: {e}")
+
+    async def _on_trade_history(self, data: Dict[str, Any]) -> None:
+        try:
+            msg = data.get("message") or {}
+            items = msg.get("trades") or msg.get("history") or msg.get("items") or []
+            parsed: List[TradeHistoryEntry] = []
+            for it in items:
+                try:
+                    d = dict(it)
+                    # normalize naming
+                    d.setdefault("status", it.get("result") or it.get("status"))
+                    d.setdefault("direction", it.get("type"))
+                    d.setdefault("opened_at", it.get("open_time") or it.get("opened_at"))
+                    d.setdefault("closed_at", it.get("close_time") or it.get("closed_at"))
+                    parsed.append(TradeHistoryEntry(**d))
+                except Exception:
+                    parsed.append(TradeHistoryEntry())
+            self._trade_history = parsed
+            logger.info(f"Trade history received: {len(parsed)} entries")
+            await self._emit_event("tradeHistory", {"history": [t.dict() for t in parsed]})
+        except Exception as e:
+            logger.error(f"tradeHistory error: {e}")
+
+    async def _on_promo_open(self, data: Dict[str, Any]) -> None:
+        try:
+            self._promo_open_payload = data.get("message") or {}
+            await self._emit_event("promoOpen", self._promo_open_payload)
+        except Exception as e:
+            logger.error(f"promoOpen error: {e}")
+
+    async def _on_expert_subscribe(self, data: Dict[str, Any]) -> None:
+        try:
+            await self._emit_event("expertSubscribe", data)
+        except Exception as e:
+            logger.error(f"expertSubscribe error: {e}")
+
+    async def _on_cancel_option(self, data: Dict[str, Any]) -> None:
+        try:
+            await self._emit_event("cancelOption", data)
+        except Exception as e:
+            logger.error(f"cancelOption error: {e}")
+
+    async def _on_set_conversion_data(self, data: Dict[str, Any]) -> None:
+        try:
+            await self._emit_event("setConversionData", data)
+        except Exception as e:
+            logger.error(f"setConversionData error: {e}")
+
     async def _get_one_time_token(self) -> str:
         if not self.token:
             raise AuthenticationError("Missing session token. Please connect/login first.")
@@ -606,16 +852,36 @@ class AsyncExpertOptionClient:
     async def _on_traders_choice(self, data: Dict[str, Any]) -> None:
         """Handle tradersChoice response"""
         try:
-            traders_data = data.get("message", {}).get("tradersChoice", [])
+            msg = data.get("message", {}) if isinstance(data, dict) else {}
+            # Broker may send the list under different keys
+            traders_data = (
+                msg.get("tradersChoice")
+                or msg.get("assets")
+                or msg.get("traders_choice", [])
+            )
+            if not isinstance(traders_data, list):
+                traders_data = []
             for trader in traders_data:
-                asset_id = trader.get("assetId")
+                asset_id = trader.get("assetId") or trader.get("asset_id")
                 put_value = trader.get("put")
                 if asset_id is not None:
-                    self._traders_choice[asset_id] = TradersChoice(asset_id=asset_id, put=put_value)
-            logger.info(f"Received traders choice data: {len(traders_data)} recommendations")
+                    self._traders_choice[asset_id] = TradersChoice(
+                        asset_id=asset_id, put=put_value
+                    )
+            # logger.info(f"Received traders choice data: {len(traders_data)} recommendations")
             await self._emit_event("tradersChoice", traders_data)
         except Exception as e:
             logger.error(f"Error processing traders choice: {e}")
+
+    async def _on_feed_or_stats(self, data: Dict[str, Any]) -> None:
+        """Handle openOptionsStat/expertOption messages containing traders choice"""
+        try:
+            msg = data.get("message", {}) if isinstance(data, dict) else {}
+            traders = msg.get("tradersChoice")
+            if traders:
+                await self._on_traders_choice({"message": {"tradersChoice": traders}})
+        except Exception as e:
+            logger.error(f"Error processing feed or stats data: {e}")
 
     async def _on_environment(self, data: Dict[str, Any]) -> None:
         try:
@@ -860,7 +1126,9 @@ class AsyncExpertOptionClient:
             "ns": order.order_id,
             "token": token,
         }
-        await self._websocket.send_message(json.dumps(payload))
+        sent = await self.send_message(json.dumps(payload))
+        if not sent:
+            raise ConnectionError("Failed to send order payload")
         logger.debug(
             f"Sent order payload (asset_id={asset_id}, dir={direction_str}, amount={order.amount}, "
             f"duration={order.duration}, shift={shift}, now={now})"
@@ -916,78 +1184,19 @@ class AsyncExpertOptionClient:
         """
         Return a symbol->info mapping of currently available assets as reported by the server.
         The info dictionary contains fields such as id, symbol, name, type, payout, is_otc, is_open,
-        available_timeframes, rates, expiration_max_seconds, shutdown_time, custom_time_enabled, purchase_time, expiration_step.
+        available_timeframes, rates, expiration_max_seconds, shutdown_time, custom_time_enabled,
+        purchase_time and expiration_step.
         """
         while True:
             try:
+                if self._assets_data:
+                    return self._assets_data.copy()
                 raw_assets = await self._get_raw_asset()
                 logger.info(f"Raw assets received: {len(raw_assets)} assets")
-                assets: Dict[str, Dict[str, Any]] = {}
-                for a in raw_assets:
-                    try:
-                        if not isinstance(a, dict):
-                            continue
-                        # use 'symbol' or fallback to 'name' or 'id'
-                        symbol = a.get("symbol") or a.get("name") or a.get("id")
-                        if not symbol:
-                            continue
-                        symbol = str(symbol)
-                        # Normalize timing fields
-                        try:
-                            step = int(a.get("expiration_step", 60) or 60)
-                        except Exception:
-                            step = 60
-                        if step <= 0:
-                            step = 60
-                        try:
-                            max_sec = int(a.get("expiration_max_seconds", 86400) or 86400)
-                        except Exception:
-                            max_sec = 86400
-                        if max_sec < 60:
-                            max_sec = 60
-                        # Prefer already-built list if present; else rebuild filtered constants
-                        candidate_tfs = set(a.get("available_timeframes") or [])
-                        if not candidate_tfs:
-                            for t in sorted(set(TIMEFRAMES.values())):
-                                if (t % step == 0) and (t <= max_sec):
-                                    candidate_tfs.add(t)
-                        available_tfs = sorted([t for t in candidate_tfs if 30 <= t <= max_sec])
-                        if not available_tfs:
-                            available_tfs = [60, 120, 180, 300, 600, 900]
-                        # Ensure numeric payout and flags
-                        try:
-                            payout_val = float(a.get("payout", a.get("profit", 0)) or 0.0)
-                        except Exception:
-                            payout_val = 0.0
-                        name_str = str(a.get("name", symbol) or "")
-                        is_otc_flag = (
-                            bool(a.get("is_otc", False))
-                            or ("otc" in name_str.lower())
-                            or ("otc" in str(symbol).lower())
-                        )
-                        is_open_flag = bool(a.get("is_open", a.get("is_active", False)))
-                        info = {
-                            "id": a.get("id"),
-                            "symbol": sanitize_symbol(symbol),
-                            "name": name_str,
-                            "type": a.get("asset_type", a.get("type", "unknown")),
-                            "payout": payout_val,
-                            "is_otc": is_otc_flag,
-                            "is_open": is_open_flag,
-                            "available_timeframes": available_tfs,
-                            "rates": a.get("rates", []),
-                            "expiration_max_seconds": max_sec,
-                            "shutdown_time": a.get("shutdown_time", None),
-                            "custom_time_enabled": bool(a.get("custom_time_enabled", 1)),
-                        }
-                        assets[sanitize_symbol(symbol)] = info
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to process asset {a.get('name', a.get('id', 'unknown'))}: {e}"
-                        )
-                        continue
-                logger.info(f"Processed {len(assets)} assets")
-                return assets
+
+                # Re-use existing update logic to parse and store assets
+                await self._on_assets_updated({"assets": raw_assets})
+                return self._assets_data.copy()
             except Exception as e:
                 logger.error(f"Failed to fetch assets: {e}")
                 await asyncio.sleep(1)
@@ -997,20 +1206,19 @@ class AsyncExpertOptionClient:
             raise ConnectionError("Not connected to ExpertOption")
         while True:
             try:
-                raw_assets = await self._get_raw_asset()
-                assets_payouts: Dict[str, int] = {}
-                for a in raw_assets:
+                assets = await self.get_available_assets()
+                payouts: Dict[str, int] = {}
+                for symbol, info in assets.items():
                     try:
-                        if isinstance(a, dict):
-                            symbol = str(a.get("symbol"))
-                            payout = int(a.get("profit", 0))
-                            is_open = bool(a.get("is_active", False))
-                            if is_open and payout > 0:
-                                key = sanitize_symbol(symbol)
-                                assets_payouts[key] = payout
+                        payout_val = float(info.get("payout", 0) or 0)
+                        if payout_val <= 1:
+                            payout_val *= 100
+                        payout = int(payout_val)
+                        if info.get("is_open") and payout > 0:
+                            payouts[sanitize_symbol(symbol)] = payout
                     except Exception:
                         continue
-                return assets_payouts
+                return payouts
             except Exception:
                 await asyncio.sleep(1)
 
@@ -1021,7 +1229,7 @@ class AsyncExpertOptionClient:
                 raise InvalidParameterError(f"Invalid asset: {asset}")
             asset_name = get_asset_symbol(asset_val) or str(asset_val)
         else:
-            asset_name = str(asset)
+            asset_name = sanitize_symbol(str(asset))
         if isinstance(timeframe, (int, float)) or str(timeframe).isdigit():
             tf_val = int(timeframe)
             if tf_val not in TIMEFRAMES.values():
@@ -1035,11 +1243,29 @@ class AsyncExpertOptionClient:
                 raw_assets = await self._get_raw_asset()
                 for a in raw_assets:
                     if isinstance(a, dict):
-                        if a.get("symbol") == asset_name:
-                            if not bool(a.get("is_active", False)):
+                        sym = sanitize_symbol(a.get("symbol"))
+                        is_otc_flag = bool(a.get("is_otc", False)) or (
+                            "otc" in str(a.get("symbol")).lower()
+                        )
+                        if is_otc_flag and not sym.endswith("_OTC"):
+                            sym = f"{sym}_OTC"
+                        if sym == asset_name:
+                            if not bool(a.get("is_active", a.get("is_open", a.get("active", False)))):
                                 logger.warning(f"Asset {asset_name} is closed")
                                 return 0.0
-                            return float(a.get("profit", 0))
+                            raw_payout = (
+                                a.get("profit")
+                                or a.get("profit_percent")
+                                or a.get("payout")
+                                or a.get("profitRate")
+                            )
+                            try:
+                                payout_val = float(raw_payout) if raw_payout is not None else 0.0
+                            except (TypeError, ValueError):
+                                return 0.0
+                            if payout_val <= 1:
+                                payout_val *= 100
+                            return float(payout_val)
                 await asyncio.sleep(1)
             except Exception:
                 await asyncio.sleep(1)
@@ -1057,7 +1283,16 @@ class AsyncExpertOptionClient:
             parsed_assets: Dict[str, Dict[str, Any]] = {}
             assets_list = data.get("assets") or []
             logger.info(f"Processing assets update: {len(assets_list)} assets")
+            try:
+                update_assets_from_api(assets_list)
+            except Exception:
+                pass
             for asset_info in assets_list:
+                #try:
+                #    if int(asset_info.get("ps", 1)) != 1:
+                #        continue
+                #except Exception:
+                #    pass
                 # Accept symbol or fallback to name/id so we don't drop assets
                 symbol_in = asset_info.get("symbol") or asset_info.get("name") or asset_info.get("id")
                 if symbol_in is None:
@@ -1083,8 +1318,17 @@ class AsyncExpertOptionClient:
                 if not available_tfs:
                     available_tfs = [60, 120, 180, 300, 600, 900]
                 # Payout / flags
+                raw_payout = (
+                    asset_info.get("profit")
+                    or asset_info.get("profit_percent")
+                    or asset_info.get("payout")
+                    or asset_info.get("profitRate")
+                )
                 try:
-                    payout = int(asset_info.get("profit") or 0)
+                    payout_val = float(raw_payout or 0)
+                    if payout_val <= 1:
+                        payout_val *= 100
+                    payout = int(payout_val)
                 except Exception:
                     payout = 0
                 name_str = str(asset_info.get("name", symbol) or "")
@@ -1099,9 +1343,14 @@ class AsyncExpertOptionClient:
                 )
                 if purchase_time < 1 or purchase_time > 300:
                     purchase_time = 30
+                    
+                asset_key = sanitize_symbol(symbol)
+                if is_otc_flag and not asset_key.endswith("_OTC"):
+                    asset_key = f"{asset_key}_OTC"
+                    
                 info = {
                     "id": asset_info.get("id"),
-                    "symbol": sanitize_symbol(symbol),
+                    "symbol": asset_key,
                     "name": name_str,
                     "type": asset_info.get("asset_type", asset_info.get("type", "unknown")),
                     "payout": payout,
@@ -1115,10 +1364,22 @@ class AsyncExpertOptionClient:
                     "purchase_time": purchase_time,
                     "expiration_step": step,
                 }
-                parsed_assets[sanitize_symbol(symbol)] = info
+                parsed_assets[asset_key] = info
             if parsed_assets:
+                # Atomic swap of the whole map to avoid empty windows
                 self._assets_data = parsed_assets
                 logger.info(f"Stored {len(parsed_assets)} assets")
+                # Signal readiness (global and per-asset)
+                try:
+                    self._assets_index_ready.set()
+                    for info in parsed_assets.values():
+                        try:
+                            aid = int(info.get("id"))
+                            self._asset_ready[aid].set()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 for request_id, future in list(self._assets_requests.items()):
                     if not future.done():
                         future.set_result(list(parsed_assets.values()))
@@ -1164,7 +1425,9 @@ class AsyncExpertOptionClient:
             timeframe_seconds = TIMEFRAMES.get(timeframe, 60)
         else:
             timeframe_seconds = int(timeframe)
-        if asset_id not in ASSETS_ID_SYMBOL:
+        # Wait for asset indexing if needed (prevents 'not found' during races)
+        ok = await self.wait_asset(int(asset_id), timeout=2.0)
+        if not ok:
             raise InvalidParameterError(f"Invalid asset ID: {asset_id}")
         try:
             candles = await self._request_candles(asset_id, timeframe_seconds, count, end_time)
@@ -1177,8 +1440,15 @@ class AsyncExpertOptionClient:
             logger.error(f"Error fetching candles for asset ID {asset_id}: {e}")
             return []
 
+    async def get_candles_dataframe(self, asset_id: int, timeframe: Union[str, int], count: int = 100, end_time: Optional[datetime] = None) -> pd.DataFrame:
+        """Fetch candles and convert them to a pandas DataFrame."""
+        candles = await self.get_candles(asset_id, timeframe, count, end_time)
+        return candles_to_dataframe(candles)
+
     async def _request_candles(self, asset_id: int, timeframe: int, count: int, end_time: Optional[datetime]):
-        if asset_id not in ASSETS_ID_SYMBOL:
+        # Ensure asset is known before asking history
+        ok = await self.wait_asset(int(asset_id), timeout=2.0)
+        if not ok:
             raise InvalidParameterError(f"Asset ID not found for {asset_id}")
         now = int(time.time()) if end_time is None else int(end_time.timestamp())
         end_ts = now - (now % timeframe)
@@ -1187,13 +1457,8 @@ class AsyncExpertOptionClient:
         request_key = f"{asset_id}_{timeframe}"
         candle_future: asyncio.Future = asyncio.get_event_loop().create_future()
         self._candle_requests[request_key] = candle_future
-        # (1) subscribe live first
-        sub_msg = {
-            "action": "subscribeCandles",
-            "message": {"assets": [{"id": int(asset_id), "timeframes": [int(timeframe)]}]},
-            "token": self.token,
-            "ns": self._next_ns(),
-        }
+        # (1) ensure subscription for live stream
+        await self.subscribe_symbol(asset_id, [timeframe])
         # (2) ask history for the window
         hist_msg = {
             "action": "assetHistoryCandles",
@@ -1205,8 +1470,12 @@ class AsyncExpertOptionClient:
             "token": self.token,
             "ns": self._next_ns(),
         }
-        await self._websocket.send_message(json.dumps(sub_msg))
-        await self._websocket.send_message(json.dumps(hist_msg))
+        sender = (
+            self._keep_alive_manager.send_message
+            if self._is_persistent and self._keep_alive_manager
+            else self._websocket.send_message
+        )
+        await sender(json.dumps(hist_msg))
         try:
             candles: List[Candle] = await asyncio.wait_for(candle_future, timeout=15.0)
             return candles[-count:]
@@ -1270,6 +1539,12 @@ class AsyncExpertOptionClient:
                 aid = int(asset_id)
             except Exception:
                 aid = asset_id
+            # If candles arrive before indexing, mark this asset as ready to unblock waiters
+            try:
+                if isinstance(aid, int):
+                    self._asset_ready[aid].set()
+            except Exception:
+                pass
             if isinstance(aid, int):
                 asset_symbol = get_asset_symbol(aid)
             asset = asset_symbol if isinstance(asset_symbol, str) else sanitize_symbol(str(aid))
@@ -1404,17 +1679,34 @@ class AsyncExpertOptionClient:
 
     # Streaming API
     async def subscribe_symbol(self, asset_id: int, timeframes: List[int]):
-        """Subscribe to live candle updates for an asset ID across the provided timeframes."""
+        """Subscribe to live candle updates for an asset ID across the provided timeframes.
+        The server enforces a cap on the number of simultaneous subscriptions. We track
+        active subscriptions locally and only send a subscribe request for new pairs,
+        mirroring the lightweight approach used by the PocketOption client.
+        """
         try:
+            new_tfs: List[int] = []
+            for tf in timeframes:
+                pair = (int(asset_id), int(tf))
+                if pair not in self._active_subscriptions:
+                    self._active_subscriptions.add(pair)
+                    new_tfs.append(int(tf))
+            if not new_tfs:
+                return
             sub_msg = {
                 "action": "subscribeCandles",
-                "message": {"assets": [{"id": int(asset_id), "timeframes": [int(tf) for tf in timeframes]}]},
+                "message": {"assets": [{"id": int(asset_id), "timeframes": new_tfs}]},
                 "token": self.token,
                 "ns": self._next_ns(),
             }
-            await self._websocket.send_message(json.dumps(sub_msg))
+            sender = (
+                self._keep_alive_manager.send_message
+                if self._is_persistent and self._keep_alive_manager
+                else self._websocket.send_message
+            )
+            await sender(json.dumps(sub_msg))
             symbol = self._symbol_from_asset_id(asset_id)
-            for tf in timeframes:
+            for tf in new_tfs:
                 key = f"{sanitize_symbol(symbol)}_{int(tf)}"
                 self._candle_stream_subs.setdefault(key, asyncio.Queue(maxsize=100))
         except Exception as e:
@@ -1426,7 +1718,8 @@ class AsyncExpertOptionClient:
         for tf in timeframes:
             key = f"{sanitize_symbol(symbol)}_{int(tf)}"
             self._candle_stream_subs.pop(key, None)
-
+            self._active_subscriptions.discard((int(asset_id), int(tf)))
+            
     async def get_stream_candle(self, asset: str, timeframe: int, timeout: float = 0.0) -> Optional[Candle]:
         """Pull one candle from the stream queue."""
         key = f"{sanitize_symbol(asset)}_{int(timeframe)}"
@@ -1780,11 +2073,22 @@ class AsyncExpertOptionClient:
         self._server_time = ServerTime(server_timestamp=local_time, local_timestamp=local_time, offset=0.0)
 
     def _validate_order_parameters(self, asset: Union[str, int], amount: float, direction: OrderDirection, duration: int) -> None:
+        # Accept either a known symbol or an int id that may arrive via live cache
         if isinstance(asset, (int, float)) or str(asset).isdigit():
-            if int(asset) not in ASSETS.values():
-                raise InvalidParameterError(f"Invalid asset: {asset}")
-        elif asset not in ASSETS:
-            raise InvalidParameterError(f"Invalid asset: {asset}")
+            aid = int(asset)
+            from .constants import ASSETS
+            if aid not in ASSETS.values():
+                # Try dynamic cache / wait briefly before failing
+                # (sync wait via loop.run_until_complete is unsafe here; we only do a quick presence check)
+                if aid not in self._known_asset_ids():
+                    raise InvalidParameterError(f"Invalid asset: {asset}")
+        else:
+            from .constants import ASSETS
+            if asset not in ASSETS:
+                # try dynamic symbols map
+                sym = sanitize_symbol(str(asset))
+                if sym not in self._assets_data:
+                    raise InvalidParameterError(f"Invalid asset: {asset}")
         if amount < API_LIMITS["min_order_amount"] or amount > API_LIMITS["max_order_amount"]:
             raise InvalidParameterError(f"Amount must be between {API_LIMITS['min_order_amount']} and {API_LIMITS['max_order_amount']}")
         if duration < API_LIMITS["min_duration"] or duration > API_LIMITS["max_duration"]:
