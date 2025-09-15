@@ -2,7 +2,7 @@
 Professional Async API Expert Option - Core module
 Fully async implementation with modern Python practices
 """
-from .client import AsyncExpertOptionClient
+from .client import AsyncExpertOptionClient, candles_to_dataframe
 from .exceptions import (
     ExpertOptionError,
     ConnectionError,
@@ -23,9 +23,24 @@ from .models import (
     ConnectionStatus,
     ServerTime,
     Asset,
+    TradersChoice,
+    UserFeedInfo,
+    MultipleActionResponse,
+    EnvironmentInfo,
+    Achievement,
+    Badge,
+    ActivatedBonus,
+    ReferralOfferInfo,
+    DepositSum,
+    TradeHistoryEntry,
+    PushNotification,
 )
 from .constants import ASSETS, TIMEFRAMES, API_LIMITS, CONNECTION_SETTINGS, CURRENCIES, REGIONS
-from .login import get_token, load_config, save_config, save_session, validate_token
+
+# Expose the login/config helpers (implemented in config.py for config/session, login.py for token)
+from .config import load_config, save_config, save_session, load_session
+from .login import get_token, validate_token, expert_get_token
+
 from .monitoring import (
     ErrorMonitor,
     HealthChecker,
@@ -39,10 +54,9 @@ from .monitoring import (
 from .utils import (
     sanitize_symbol,
     format_session_id,
-    candles_to_dataframe,
-    retry_async,
     timestamp_to_datetime,
     format_initial_message,
+    format_timeframe,
 )
 from .connection_keep_alive import ConnectionKeepAlive
 
@@ -73,11 +87,15 @@ __all__ = [
     "CONNECTION_SETTINGS",
     "CURRENCIES",
     "REGIONS",
+    # login/config helpers
     "get_token",
+    "expert_get_token",
+    "validate_token",
     "load_config",
     "save_config",
     "save_session",
-    "validate_token",
+    "load_session",
+    # monitoring
     "ErrorMonitor",
     "HealthChecker",
     "ErrorSeverity",
@@ -86,11 +104,25 @@ __all__ = [
     "RetryPolicy",
     "error_monitor",
     "health_checker",
+    # utils
     "sanitize_symbol",
     "format_session_id",
     "candles_to_dataframe",
-    "retry_async",
     "timestamp_to_datetime",
     "format_initial_message",
+    "format_timeframe",
+    # connection keep alive
     "ConnectionKeepAlive",
+    # new exports
+    "TradersChoice",
+    "UserFeedInfo",
+    "MultipleActionResponse",
+    "EnvironmentInfo",
+    "Achievement",
+    "Badge",
+    "ActivatedBonus",
+    "ReferralOfferInfo",
+    "DepositSum",
+    "TradeHistoryEntry",
+    "PushNotification",
 ]
