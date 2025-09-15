@@ -1,47 +1,88 @@
-✨ API-ExpertOption – Setup & Installation (Playwright Login Ready)
+# ✨ API-Expert-Option – Setup & Installation (Token Login Ready)
 
-> **Purpose:** A polished, one-stop setup guide for installing **API-ExpertOption**, enabling **Playwright**-based login (Token extraction), and running your first test.
+> A fast setup guide for installing **API-Expert-Option**, enabling **Playwright**-based token login (get_token), and testing your first connection.
 
 <p align="center">
-  <a href="https://github.com/A11ksa/API-Expert-Option"><img alt="AsyncIO" src="https://img.shields.io/badge/Framework-AsyncIO-informational" /></a>
-  <a href="https://github.com/A11ksa/API-Expert-Option"><img alt="Playwright" src="https://img.shields.io/badge/Login-Playwright-blue" /></a>
-  <a href="https://github.com/A11ksa/API-Expert-Option"><img alt="Status" src="https://img.shields.io/badge/Status-Stable-success" /></a>
-  <a href="https://github.com/A11ksa/API-Expert-Option/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/A11ksa/API-Expert-Option" /></a>
+  <img alt="Python" src="https://img.shields.io/pypi/pyversions/pandas?label=python&logo=python" />
+  <img alt="AsyncIO" src="https://img.shields.io/badge/Framework-AsyncIO-informational" />
+  <img alt="Playwright" src="https://img.shields.io/badge/Login-Playwright-blue" />
+  <img alt="Status" src="https://img.shields.io/badge/Status-Stable-success" />
+  <img alt="License" src="https://img.shields.io/github/license/A11ksa/API-Expert-Option" />
 </p>
 
 ---
 
-## 🔗 Quick Links
-- **Repo:** https://github.com/A11ksa/API-Expert-Option
-- **README:** See top-level `README.md` for API overview and examples
-- **Issues:** https://github.com/A11ksa/API-Expert-Option/issues
+## ✅ Requirements
+
+- Python 3.8+
+- `pip`, `venv`, and `playwright`
+- Access to `expertoption.com` from your region
 
 ---
 
-## ✅ Prerequisites
-- **Python 3.8+** (3.9+ recommended)
-- `pip` and optionally `venv`
-- Playwright browsers (we’ll install Chromium)
-- Network access to `expertoption.com`
+## ⚙️ Installation
 
----
-
-## ⚡ Install (recommended flow)
 ```bash
-# 1) Clone
-git clone https://github.com/A11ksa/API-Expert-Option.git
+git clone https://github.com/A11ksa/API-Expert-Option
 cd API-Expert-Option
-
-# 2) Virtualenv
 python -m venv venv
-# Linux/macOS:
-source venv/bin/activate
-# Windows:
-venv\Scripts\activate
-
-# 3) Install package
+source venv/bin/activate  # or venv\Scripts\activate on Windows
 pip install -U pip
 pip install .
-
-# 4) Install Playwright browser(s)
 python -m playwright install chromium
+```
+
+---
+
+## 🔐 Login Setup (get_token)
+
+```json
+# sessions/config.json
+{
+  "email": "you@example.com",
+  "password": "YourPassword"
+}
+```
+
+> First-time login opens Chromium → logs in → saves your **demo/live token** into:
+```
+sessions/session.json
+```
+
+---
+
+## 🧪 Run Smoke Test
+
+```bash
+python test1.py
+```
+
+Expected output:
+- Connection success
+- Account balance
+- (optional) place order
+- Result WIN/LOSS/DRAW
+
+---
+
+## 🆘 Troubleshooting
+
+| Problem               | Solution                                 |
+|-----------------------|------------------------------------------|
+| Playwright error      | `python -m playwright install chromium`  |
+| Token expired         | Delete `session.json` and retry login    |
+| SSL error             | Check Python + OpenSSL install           |
+| No candles/trades     | Check IP / region or try VPN             |
+
+---
+
+## 📬 Contact
+
+📧 [ar123ksa@gmail.com](mailto:ar123ksa@gmail.com)  
+💬 [Telegram: @A11ksa](https://t.me/A11ksa)
+
+---
+
+## 🏁 Done
+
+You’re now ready to trade with **Expert Option** + fully async Python client.
