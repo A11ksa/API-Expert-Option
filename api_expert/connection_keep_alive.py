@@ -63,6 +63,11 @@ class ConnectionKeepAlive:
 
     # Connection
     async def connect_with_keep_alive(self, regions: Optional[List[str]] = None) -> bool:
+        """
+        Establish websocket connection and start keep-alive tasks.
+        Immediately bootstraps the session by sending a multipleAction bundle which includes
+        'assets' so the client cache is populated early with the live asset list.
+        """
         if not self._websocket:
             self._websocket = self._websocket_client_class()
             # Wire WS events
@@ -76,7 +81,7 @@ class ConnectionKeepAlive:
             self._websocket.add_event_handler("assets_updated", self._forward_assets_updated)
             self._websocket.add_event_handler("stream_update", self._forward_stream_update)
             self._websocket.add_event_handler("json_data", self._forward_json_data)
-        # [UPDATE] Send setContext and verify response
+
         set_context_ns = str(uuid.uuid4())
         set_context = json.dumps({
             "action": "setContext",
@@ -85,6 +90,7 @@ class ConnectionKeepAlive:
             "ns": set_context_ns
         })
         initial_message = self._format_initial_message()
+
         from .constants import REGIONS
         if not regions:
             if self.is_demo:
@@ -93,32 +99,29 @@ class ConnectionKeepAlive:
                 regions = [name for name, url in all_regions.items() if url in demo_urls]
             else:
                 all_regions = REGIONS.get_all_regions()
-                regions = [name for name, url in all_regions.items() if "DEMO" not in name.upper()]
+                regions = [name for name in all_regions.keys()]
+
         for region_name in regions:
             region_url = REGIONS.get_region(region_name)
             if not region_url:
                 continue
             try:
                 urls = [region_url]
-                logger.info(f"Trying to connect to {region_name} ({region_url})")
+                logger.info(f"Trying to connect to {region_name} ({region_url})")  # type: ignore[name-defined]
                 success = await asyncio.wait_for(self._websocket.connect(urls, set_context), timeout=10.0)
                 if success:
-                    # [UPDATE] Wait for setContext
-                    try:
-                        logger.warning(f"setContext {region_name}: mode.")
-                    except asyncio.TimeoutError:
-                        logger.info(f"setContext {region_name}")
-                    logger.info(f"WebSocket connected successfully to {region_name}")
+                    logger.info(f"WebSocket connected successfully to {region_name}")  # type: ignore[name-defined]
                     self.is_connected = True
                     self._start_keep_alive_tasks()
                     await self._trigger_event_async("connected", data={"region": region_name, "url": region_url})
-                    await self._websocket.send_message(initial_message) # bootstrap immediately
+                    # Bootstrap: profile + assets + defaults
+                    await self._websocket.send_message(initial_message)
                     self._connection_stats["messages_sent"] += 1
                     return True
             except asyncio.TimeoutError:
-                logger.warning(f"Connection timeout to {region_name}")
+                logger.warning(f"Connection timeout to {region_name}")  # type: ignore[name-defined]
             except Exception as e:
-                logger.warning(f"Failed to connect to {region_name}: {e}")
+                logger.warning(f"Failed to connect to {region_name}: {e}")  # type: ignore[name-defined]
         return False
 
     # Tasks
@@ -161,21 +164,25 @@ class ConnectionKeepAlive:
                 self.is_connected = False
 
     async def _assets_request_loop(self):
-        logger.info("Starting assets request loop...")
+        """
+        Periodically request the assets list so the live cache stays fresh,
+        which is critical for resolving live asset IDs correctly.
+        """
+        logger.info("Starting assets request loop...")  # type: ignore[name-defined]
         while self.is_connected and self._websocket:
             try:
-                # throttle every 30s
                 assets_message = json.dumps({
                     "action": "assets",
+                    "message": {"mode": ["vanilla"]},
                     "token": self.token,
                     "ns": str(uuid.uuid4())
                 })
                 await self._websocket.send_message(assets_message)
                 self._connection_stats["messages_sent"] += 1
-                logger.debug("Assets data request sent")
+                logger.debug("Assets data request sent")  # type: ignore[name-defined]
                 await asyncio.sleep(30)
             except Exception as e:
-                logger.warning(f"Assets request failed: {e}")
+                logger.warning(f"Assets request failed: {e}")  # type: ignore[name-defined]
                 self.is_connected = False
 
     async def _reconnection_monitor(self):
@@ -207,8 +214,16 @@ class ConnectionKeepAlive:
         logger.info("WebSocket connection closed")
         await self._trigger_event_async("disconnected", data={})
 
+    async def _ensure_connection(self, timeout: float = 5.0) -> bool:
+        start = time.time()
+        while time.time() - start < timeout:
+            if self.is_connected and self._websocket and self._websocket.is_connected:
+                return True
+            await asyncio.sleep(0.05)
+        return self.is_connected and self._websocket and self._websocket.is_connected
+
     async def send_message(self, message):
-        if not self.is_connected or not self._websocket:
+        if not await self._ensure_connection():
             raise ConnectionError("Not connected")
         try:
             await self._websocket.send_message(message)
@@ -229,6 +244,19 @@ class ConnectionKeepAlive:
             action = data.get("action")
             if action == "pong":
                 self._connection_stats["last_pong_time"] = time.time()
+            elif action == "ping":
+                try:
+                    stamp = (data.get("message") or {}).get("data")
+                    pong = json.dumps({
+                        "action": "pong",
+                        "message": {"data": stamp},
+                        "token": self.token,
+                        "ns": data.get("ns") or str(uuid.uuid4()),
+                    })
+                    await self.send_message(pong)
+                except Exception as e:
+                    logger.warning(f"KA pong failed: {e}")
+                return
             elif action == "assets":
                 await self._trigger_event_async("assets_updated", data=data)
             elif action == "candles":
@@ -262,24 +290,7 @@ class ConnectionKeepAlive:
             {"action": "getCountries", "ns": str(uuid.uuid4()), "token": self.token},
             {
                 "action": "environment",
-                "message": {
-                    "supportedFeatures": [
-                        "achievements","trade_result_share","tournaments","referral","twofa",
-                        "inventory","deposit_withdrawal_error_handling","report_a_problem_form",
-                        "ftt_trade","stocks_trade"
-                    ],
-                    "supportedAbTests": [
-                        "tournament_glow","floating_exp_time","tutorial","tutorial_account_type",
-                        "tutorial_account_type_reg","hide_education_section","in_app_update_android_2",
-                        "auto_consent_reg","btn_finances_to_register","battles_4th_5th_place_rewards",
-                        "show_achievements_bottom_sheet","kyc_webview","promo_story_priority",
-                        "force_lang_in_app","one_click_deposit"
-                    ],
-                    "supportedInventoryItems": [
-                        "riskless_deal","profit","eopoints","tournaments_prize_x3","mystery_box",
-                        "special_deposit_bonus","cashback_offer"
-                    ]
-                },
+                "message": {"supportedFeatures": [], "supportedAbTests": [], "supportedInventoryItems": []},
                 "ns": str(uuid.uuid4()),
                 "token": self.token
             },
@@ -290,7 +301,6 @@ class ConnectionKeepAlive:
         return json.dumps({"action": "multipleAction", "message": {"actions": actions}, "token": self.token, "ns": str(uuid.uuid4())})
 
     def get_stats(self) -> Dict[str, Any]:
-        """Expose basic keep-alive stats to the client."""
         return {
             **self._connection_stats,
             "websocket_connected": bool(getattr(self._websocket, "is_connected", False)),
