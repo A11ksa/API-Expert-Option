@@ -138,7 +138,6 @@ def update_assets_from_api(api_assets: List[Dict[str, Any]]) -> None:
         try:
             full_sym = str(a.get("symbol") or "").strip()
             aid = int(a.get("id"))
-            # Find shortened symbol corresponding to full API symbol
             short_sym = next((short for short, full in SHORT_TO_FULL_NAME.items() if full == full_sym), full_sym)
             if short_sym and aid and ASSETS.get(short_sym) != aid:
                 ASSETS[short_sym] = aid
@@ -250,42 +249,51 @@ API_LIMITS = {
     "rate_limit": 100,
 }
 
+# Updated list with all server actions
 WS_MESSAGE_TYPES = {
-    # General framework
+    # Framework / session
     "multipleAction": "multipleAction",
     "profile": "profile",
     "userGroup": "userGroup",
     "error": "error",
-
-    # Environment and preparation
-    "environment": "environment",
-    "getCandlesTimeframes": "getCandlesTimeframes",
+    "getOneTimeToken": "getOneTimeToken",
+    "setContext": "setContext",
     "setTimeZone": "setTimeZone",
+    "getCandlesTimeframes": "getCandlesTimeframes",
     "getCurrency": "getCurrency",
     "getCountries": "getCountries",
+    "environment": "environment",
+    "setConversionData": "setConversionData",
 
-    # Origins and Candles
+    # Assets & market data
     "assets": "assets",
     "candles": "candles",
     "assetHistoryCandles": "assetHistoryCandles",
     "defaultSubscribeCandles": "defaultSubscribeCandles",
     "subscribeCandles": "subscribeCandles",
+    "tradersChoice": "tradersChoice",
+    "expertOption": "expertOption",
+    "expertSubscribe": "expertSubscribe",
 
-    # Trading and results
+    # Orders & results
+    "buyOption": "buyOption",
     "buySuccessful": "buySuccessful",
     "openTradeSuccessful": "openTradeSuccessful",
     "closeTradeSuccessful": "closeTradeSuccessful",
     "optionFinished": "optionFinished",
     "tradesStatus": "tradesStatus",
+    "cancelOption": "cancelOption",
 
-    # Statistics and Feed
-    "openOptionsStat": "openOptionsStat",
-    "expertOption": "expertOption",
-    "tradersChoice": "tradersChoice",
+    # Account / user meta
     "userFeedInfo": "userFeedInfo",
-
-    # Token verification
-    "getOneTimeToken": "getOneTimeToken",
+    "userAchievements": "userAchievements",
+    "userBadges": "userBadges",
+    "activatedBonuses": "activatedBonuses",
+    "userDepositSum": "userDepositSum",
+    "referralOfferInfo": "referralOfferInfo",
+    "tradeHistory": "tradeHistory",
+    "promoOpen": "promoOpen",
+    "checkPushNotifications": "checkPushNotifications",
 
     # Ping/Pong
     "ping": "ping",
