@@ -353,14 +353,16 @@ class AsyncWebSocketClient:
                 "defaultSubscribeCandles", "subscribeCandles",
                 "buySuccessful", "openTradeSuccessful",
                 "tradesStatus", "closeTradeSuccessful", "optionFinished",
-                "expertOption", "openOptionsStat",
-                "tradersChoice", "multipleAction",
-                "profile", "userGroup", "userFeedInfo",
-                "environment", "getCandlesTimeframes",
-                "setTimeZone", "getCurrency", "getCountries",
-                "getOneTimeToken",
+                "expertOption", "openOptionsStat", "tradersChoice", "multipleAction",
+                "profile", "userGroup", "userFeedInfo", "environment", "getCandlesTimeframes",
+                "setTimeZone", "getCurrency", "getCountries", "setConversionData",
+                "getOneTimeToken", "historySteps", "checkPushNotifications",
+                "userAchievements", "referralOfferInfo", "userBadges", "promoOpen",
+                "userDepositSum", "expertSubscribe", "cancelOption", "optionCanceled",
             )
             if action in ROUTED:
+                if action == "assets":
+                    await self._emit_event("assets_updated", data.get("message", {}))
                 self._responses.append(data)
                 self.response_queue.append(data)
             else:
