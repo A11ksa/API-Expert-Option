@@ -1,6 +1,4 @@
-
-```markdown
-# ✨ API-ExpertOption – Setup & Installation (Playwright Login Ready)
+✨ API-ExpertOption – Setup & Installation (Playwright Login Ready)
 
 > **Purpose:** A polished, one-stop setup guide for installing **API-ExpertOption**, enabling **Playwright**-based login (Token extraction), and running your first test.
 
